@@ -25,16 +25,16 @@ cargo fmt --all -- --check
 cd ../..
 
 echo "Checking that CTAP2 builds properly..."
-cargo check --release --target=thumbv7em-none-eabi
-cargo check --release --target=thumbv7em-none-eabi --features with_ctap1
-cargo check --release --target=thumbv7em-none-eabi --features debug_ctap
-cargo check --release --target=thumbv7em-none-eabi --features debug_ctap,with_ctap1
+cargo check --release --target=thumbv7em-none-eabihf
+cargo check --release --target=thumbv7em-none-eabihf --features with_ctap1
+cargo check --release --target=thumbv7em-none-eabihf --features debug_ctap
+cargo check --release --target=thumbv7em-none-eabihf --features debug_ctap,with_ctap1
 
 echo "Checking that examples build properly..."
-cargo check --release --target=thumbv7em-none-eabi --examples
+cargo check --release --target=thumbv7em-none-eabihf --examples
 
 echo "Checking that CTAP2 builds and links properly (1 set of features)..."
-cargo build --release --target=thumbv7em-none-eabi --features with_ctap1
+cargo build --release --target=thumbv7em-none-eabihf --features with_ctap1
 
 if [ -z "${TRAVIS_OS_NAME}" -o "${TRAVIS_OS_NAME}" = "linux" ]
 then

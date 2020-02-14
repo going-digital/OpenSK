@@ -36,7 +36,7 @@ before-install:
   - openssl version
 
 install:
-  - rustup target add thumbv7em-none-eabihf
+  - rustup target add thumbv7em-none-eabi
   - rustup component add rustfmt
   - cargo install cargo-audit
 

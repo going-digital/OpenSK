@@ -163,11 +163,11 @@ build_app () {
   local feature_list="$(comma_separated "$@")"
   cargo build \
     --release \
-    --target=thumbv7em-none-eabihf \
+    --target=thumbv7em-none-eabi \
     --features="${feature_list}"
 
   mkdir -p "target/tab"
-  cp "target/thumbv7em-none-eabihf/release/ctap2" "$elf_file_name"
+  cp "target/thumbv7em-none-eabi/release/ctap2" "$elf_file_name"
 
   elf2tab \
     "${elf2tab_package_param}" "ctap2" \
@@ -183,12 +183,12 @@ build_crypto_bench () {
   local feature_list="$(comma_separated "$@")"
   cargo build \
     --release \
-    --target=thumbv7em-none-eabihf \
+    --target=thumbv7em-none-eabi \
     --features="${feature_list}" \
     --example crypto_bench
 
   mkdir -p "target/tab"
-  cp "target/thumbv7em-none-eabihf/release/examples/crypto_bench" "$elf_file_name"
+  cp "target/thumbv7em-none-eabi/release/examples/crypto_bench" "$elf_file_name"
 
   elf2tab \
     "${elf2tab_package_param}" "crypto_bench" \
@@ -292,7 +292,7 @@ target_toolchain=$(head -n 1 rust-toolchain)
 if [ "x${current_toolchain}" != "x${target_toolchain}" ]
 then
   rustup install "${target_toolchain}"
-  rustup target add thumbv7em-none-eabihf
+  rustup target add thumbv7em-none-eabi
 fi
 
 if [ "$install_os" = "Y" ]

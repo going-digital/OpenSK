@@ -80,7 +80,7 @@ generate_crypto_materials N
 
 rustup install $(head -n 1 rust-toolchain)
 pip3 install --user --upgrade tockloader
-rustup target add thumbv7em-none-eabihf
+rustup target add thumbv7em-none-eabi
 
 # Install dependency to create applications.
 cargo install elf2tab

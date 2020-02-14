@@ -83,7 +83,7 @@ Requirement already satisfied, skipping upgrade: colorama>=0.3.7 in /usr/lib/pyt
 Requirement already satisfied, skipping upgrade: crcmod>=1.7 in /usr/lib/python3/dist-packages (from tockloader) (1.7)
 Requirement already satisfied, skipping upgrade: pyserial>=3.0.1 in /usr/lib/python3/dist-packages (from tockloader) (3.4)
 Requirement already satisfied, skipping upgrade: pytoml>=0.1.11 in /usr/lib/python3/dist-packages (from tockloader) (0.1.21)
-info: component 'rust-std' for target 'thumbv7em-none-eabihf' is up to date
+info: component 'rust-std' for target 'thumbv7em-none-eabi' is up to date
     Updating crates.io index
      Ignored package `elf2tab v0.4.0` is already installed, use --force to override
 ```
@@ -155,8 +155,8 @@ Our build script is responsible for converting `opensk_cert.pem` and
        Compiling nrf52840dk v0.1.0 (./third_party/tock/boards/nordic/nrf52840dk)
         Finished release [optimized + debuginfo] target(s) in 11.28s
        text    data     bss     dec     hex filename
-     114688    1760  260384  376832   5c000 target/thumbv7em-none-eabihf/release/nrf52840dk
-     tockloader  flash --address 0x00000 --jlink --board nrf52dk target/thumbv7em-none-eabihf/release/nrf52840dk.bin
+     114688    1760  260384  376832   5c000 target/thumbv7em-none-eabi/release/nrf52840dk
+     tockloader  flash --address 0x00000 --jlink --board nrf52dk target/thumbv7em-none-eabi/release/nrf52840dk.bin
      [STATUS ] Flashing binar(y|ies) to board...
      [INFO   ] Using known arch and jtag-device for known board nrf52dk
      [INFO   ] Finished in 0.324 seconds
@@ -219,8 +219,8 @@ the board in order to see your OpenSK device on your system.
        Compiling nrf52840_dongle v0.1.0 (./third_party/tock/boards/nordic/nrf52840_dongle)
          Finished release [optimized + debuginfo] target(s) in 10.47s
        text    data     bss     dec     hex filename
-     110592    1688  252264  364544   59000 target/thumbv7em-none-eabihf/release/nrf52840_dongle
-     tockloader  flash --address 0x00000 --jlink --board nrf52dk target/thumbv7em-none-eabihf/release/nrf52840_dongle.bin
+     110592    1688  252264  364544   59000 target/thumbv7em-none-eabi/release/nrf52840_dongle
+     tockloader  flash --address 0x00000 --jlink --board nrf52dk target/thumbv7em-none-eabi/release/nrf52840_dongle.bin
      [STATUS ] Flashing binar(y|ies) to board...
      [INFO   ] Using known arch and jtag-device for known board nrf52dk
      [INFO   ] Finished in 0.296 seconds

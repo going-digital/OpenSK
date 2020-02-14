@@ -325,3 +325,8 @@ then
   tockloader flash "${tockloader_flags[@]}" -a 0x30000 "${tab_folder}/padding.bin"
   tockloader install "${tockloader_flags[@]}" -a 0x40000 "${tab_folder}/${install_app}.tab"
 fi
+
+if [ "$install_app" = "crypto_bench" ]
+then
+  tockloader listen --jlink --board="${board:-nrf52840}" --jlink-device=nrf52840_xxaa
+fi

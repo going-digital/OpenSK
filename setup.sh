@@ -46,6 +46,11 @@ EOF
   exit 1
 }
 
+# Copy additional boards to the kernel.
+echo -n '[-] Copying additional boards to Tock... '
+cp -r boards/* third_party/tock/boards
+echo $done_text
+
 # Apply patches to kernel. Do that in a sub-shell
 (
   cd third_party/tock/ && \
@@ -81,8 +86,8 @@ source tools/gen_key_materials.sh
 generate_crypto_materials N
 
 rustup install $(head -n 1 rust-toolchain)
-pip3 install --user --upgrade tockloader six intelhex
+pip3 install --user --upgrade 'tockloader==1.4' six intelhex
 rustup target add thumbv7em-none-eabi
 
 # Install dependency to create applications.
-cargo install elf2tab
+cargo install elf2tab --version 0.5.0

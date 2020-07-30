@@ -29,6 +29,10 @@ Although we tested and implemented our firmware based on the published
 [CTAP2.0 specifications](https://fidoalliance.org/specs/fido-v2.0-ps-20190130/fido-client-to-authenticator-protocol-v2.0-ps-20190130.html),
 our implementation was not reviewed nor officially tested and doesn't claim to
 be FIDO Certified.
+We started adding features of the upcoming next version of the
+[CTAP2.1 specifications](https://fidoalliance.org/specs/fido2/fido-client-to-authenticator-protocol-v2.1-rd-20191217.html).
+The development is currently between 2.0 and 2.1, with updates hidden behind a feature flag.
+Please add the flag `--ctap2.1` to the deploy command to include them.
 
 ### Cryptography
 
@@ -95,6 +99,10 @@ a few things you can personalize:
 4.  Depending on your available flash storage, choose an appropriate maximum
     number of supported residential keys and number of pages in
     `ctap/storage.rs`.
+5.  Change the default level for the credProtect extension in `ctap/mod.rs`.
+    When changing the default, resident credentials become undiscoverable without
+    user verification. This helps privacy, but can make usage less comfortable
+    for credentials that need less protection.
 
 ### 3D printed enclosure
 
@@ -106,6 +114,70 @@ All the required files can be downloaded from
 [Thingiverse](https://www.thingiverse.com/thing:4132768) including the STEP
 file, allowing you to easily make the modifications you need to further
 customize it.
+
+## Development and testing
+
+### Printing panic messages to the console
+
+By default, libtock-rs blinks some LEDs when the userspace application panicks.
+This is not always convenient as the panic message is lost. In order to enable
+a custom panic handler that first writes the panic message via Tock's console
+driver, before faulting the app, you can use the `--panic-console` flag of the
+`deploy.py` script.
+
+```shell
+# Example on Nordic nRF52840-DK board
+./deploy.py --board=nrf52840dk --opensk --panic-console
+```
+
+### Debugging memory allocations
+
+You may want to track memory allocations to understand the heap usage of
+OpenSK. This can be useful if you plan to port it to a board with fewer
+available RAM for example. To do so, you can enable the `--debug-allocations`
+flag of the `deploy.py` script. This enables a custom (userspace) allocator
+that prints a message to the console for each allocation and deallocation
+operation.
+
+The additional output looks like the following.
+
+```
+# Allocation of 256 byte(s), aligned on 1 byte(s). The allocated address is
+# 0x2002401c. After this operation, 2 pointers have been allocated, totalling
+# 384 bytes (the total heap usage may be larger, due to alignment and
+# fragmentation of allocations within the heap).
+alloc[256, 1] = 0x2002401c (2 ptrs, 384 bytes)
+# Deallocation of 64 byte(s), aligned on 1 byte(s), from address 0x2002410c.
+# After this operation, 1 pointers are allocated, totalling 512 bytes.
+dealloc[64, 1] = 0x2002410c (1 ptrs, 512 bytes)
+```
+
+A tool is provided to analyze such reports, in `tools/heapviz`. This tool
+parses the console output, identifies the lines corresponding to (de)allocation
+operations, and first computes some statistics:
+
+- Address range used by the heap over this run of the program,
+- Peak heap usage (how many useful bytes are allocated),
+- Peak heap consumption (how many bytes are used by the heap, including
+  unavailable bytes between allocated blocks, due to alignment constraints and
+  memory fragmentation),
+- Fragmentation overhead (difference between heap consumption and usage).
+
+Then, the `heapviz` tool displays an animated "movie" of the allocated bytes in
+heap memory. Each frame in this "movie" shows bytes that are currently
+allocated, that were allocated but are now freed, and that have never been
+allocated. A new frame is generated for each (de)allocation operation. This tool
+uses the `ncurses` library, that you may have to install beforehand.
+
+You can control the tool with the following parameters:
+- `--logfile` (required) to provide the file which contains the console output
+  to parse,
+- `--fps` (optional) to customize the number of frames per second in the movie
+  animation.
+
+```shell
+cargo run --manifest-path tools/heapviz/Cargo.toml -- --logfile console.log --fps 50
+```
 
 ## Contributing
 

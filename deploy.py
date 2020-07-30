@@ -29,6 +29,7 @@ import sys
 
 import colorama
 from six.moves import input
+import tockloader
 from tockloader import tab
 from tockloader import tbfh
 from tockloader import tockloader as loader
@@ -59,6 +60,10 @@ OpenSKBoard = collections.namedtuple(
         "app_ldscript",
         # Flash address at which the app should be written
         "app_address",
+        # Flash address of the storage
+        "storage_address",
+        # Size of the storage
+        "storage_size",
         # Target name for flashing the board using pyOCD
         "pyocd_target",
         # The cfg file in OpenOCD board folder
@@ -86,8 +91,10 @@ SUPPORTED_BOARDS = {
             page_size=4096,
             kernel_address=0,
             padding_address=0x30000,
-            app_ldscript="nrf52840dk_layout.ld",
+            app_ldscript="nrf52840_layout.ld",
             app_address=0x40000,
+            storage_address=0xC0000,
+            storage_size=0x40000,
             pyocd_target="nrf52840",
             openocd_board="nordic_nrf52840_dongle.cfg",
             openocd_options=[],
@@ -103,8 +110,10 @@ SUPPORTED_BOARDS = {
             page_size=4096,
             kernel_address=0,
             padding_address=0x30000,
-            app_ldscript="nrf52840dk_layout.ld",
+            app_ldscript="nrf52840_layout.ld",
             app_address=0x40000,
+            storage_address=0xC0000,
+            storage_size=0x40000,
             pyocd_target="nrf52840",
             openocd_board="nordic_nrf52840_dongle.cfg",
             openocd_options=[],
@@ -115,13 +124,15 @@ SUPPORTED_BOARDS = {
         ),
     "nrf52840_dongle_dfu":
         OpenSKBoard(
-            path="boards/nrf52840_dongle_dfu",
+            path="third_party/tock/boards/nordic/nrf52840_dongle_dfu",
             arch="thumbv7em-none-eabi",
             page_size=4096,
             kernel_address=0x1000,
             padding_address=0x30000,
-            app_ldscript="nrf52840dk_layout.ld",
+            app_ldscript="nrf52840_layout.ld",
             app_address=0x40000,
+            storage_address=0xC0000,
+            storage_size=0x40000,
             pyocd_target="nrf52840",
             openocd_board="nordic_nrf52840_dongle.cfg",
             openocd_options=[],
@@ -132,13 +143,15 @@ SUPPORTED_BOARDS = {
         ),
     "nrf52840_mdk_dfu":
         OpenSKBoard(
-            path="boards/nrf52840_mdk_dfu",
+            path="third_party/tock/boards/nordic/nrf52840_mdk_dfu",
             arch="thumbv7em-none-eabi",
             page_size=4096,
             kernel_address=0x1000,
             padding_address=0x30000,
-            app_ldscript="nrf52840dk_layout.ld",
+            app_ldscript="nrf52840_layout.ld",
             app_address=0x40000,
+            storage_address=0xC0000,
+            storage_size=0x40000,
             pyocd_target="nrf52840",
             openocd_board="nordic_nrf52840_dongle.cfg",
             openocd_options=[],
@@ -151,7 +164,7 @@ SUPPORTED_BOARDS = {
 
 # The STACK_SIZE value below must match the one used in the linker script
 # used by the board.
-# e.g. for Nordic nRF52840 boards the file is `nrf52840dk_layout.ld`.
+# e.g. for Nordic nRF52840 boards the file is `nrf52840_layout.ld`.
 STACK_SIZE = 0x4000
 
 # The following value must match the one used in the file
@@ -250,19 +263,32 @@ class OpenSKInstaller:
     self.tockloader_default_args = argparse.Namespace(
         arch=board.arch,
         board=self.args.board,
+        bundle_apps=False,
         debug=False,
         force=False,
+        jlink_cmd="JLinkExe",
         jlink=self.args.programmer == "jlink",
         jlink_device=board.jlink_device,
         jlink_if=board.jlink_if,
         jlink_speed=1200,
         openocd=self.args.programmer == "openocd",
         openocd_board=board.openocd_board,
+        openocd_cmd="openocd",
+        openocd_commands=copy.copy(board.openocd_commands),
+        openocd_options=copy.copy(board.openocd_options),
         jtag=False,
         no_bootloader_entry=False,
         page_size=board.page_size,
         port=None,
     )
+
+  def checked_command(self, cmd, env=None, cwd=None):
+    stdout = None if self.args.verbose_build else subprocess.DEVNULL
+    try:
+      subprocess.run(
+          cmd, stdout=stdout, timeout=None, check=True, env=env, cwd=cwd)
+    except subprocess.CalledProcessError as e:
+      fatal("Failed to execute {}: {}".format(cmd[0], str(e)))
 
   def checked_command_output(self, cmd, env=None, cwd=None):
     cmd_output = ""
@@ -291,22 +317,35 @@ class OpenSKInstaller:
       # empty value.
       target_toolchain.append("")
     current_version = self.checked_command_output(["rustc", "--version"])
-    if not all((target_toolchain[0] in current_version,
-                target_toolchain[1] in current_version)):
+    if not (target_toolchain[0] in current_version and
+            target_toolchain[1] in current_version):
       info("Updating rust toolchain to {}".format("-".join(target_toolchain)))
       # Need to update
-      self.checked_command_output(
-          ["rustup", "install", target_toolchain_fullstring])
-    self.checked_command_output(
-        ["rustup", "target", "add", SUPPORTED_BOARDS[self.args.board].arch])
+      rustup_install = ["rustup"]
+      if self.args.verbose_build:
+        rustup_install.append("--verbose")
+      rustup_install.extend(["install", target_toolchain_fullstring])
+      self.checked_command(rustup_install)
+
+    rustup_target = ["rustup"]
+    if self.args.verbose_build:
+      rustup_target.append("--verbose")
+    rustup_target.extend(
+        ["target", "add", SUPPORTED_BOARDS[self.args.board].arch])
+    self.checked_command(rustup_target)
     info("Rust toolchain up-to-date")
 
   def build_tockos(self):
     info("Building Tock OS for board {}".format(self.args.board))
     props = SUPPORTED_BOARDS[self.args.board]
-    out_directory = os.path.join(props.path, "target", props.arch, "release")
+    out_directory = os.path.join("third_party", "tock", "target", props.arch,
+                                 "release")
     os.makedirs(out_directory, exist_ok=True)
-    self.checked_command_output(["make"], cwd=props.path)
+
+    env = os.environ.copy()
+    if self.args.verbose_build:
+      env["V"] = "1"
+    self.checked_command(["make"], cwd=props.path, env=env)
 
   def build_example(self):
     info("Building example {}".format(self.args.application))
@@ -341,7 +380,9 @@ class OpenSKInstaller:
     ]
     if is_example:
       command.extend(["--example", self.args.application])
-    self.checked_command_output(command, env=env)
+    if self.args.verbose_build:
+      command.append("--verbose")
+    self.checked_command(command, env=env)
     app_path = os.path.join("target", props.arch, "release")
     if is_example:
       app_path = os.path.join(app_path, "examples")
@@ -363,20 +404,21 @@ class OpenSKInstaller:
     assert self.args.application
     info("Generating Tock TAB file for application/example {}".format(
         self.args.application))
-    package_parameter = "-n"
     elf2tab_ver = self.checked_command_output(["elf2tab", "--version"]).split(
-        " ", maxsplit=1)[1]
-    # Starting from v0.5.0-dev the parameter changed.
-    # Current pyblished crate is 0.4.0 but we don't want developers
-    # running the HEAD from github to be stuck
-    if "0.5.0-dev" in elf2tab_ver:
-      package_parameter = "--package-name"
+        "\n", maxsplit=1)[0]
+    if elf2tab_ver != "elf2tab 0.5.0":
+      error(
+          ("Detected unsupported elf2tab version {!a}. The following "
+           "commands may fail. Please use 0.5.0 instead.").format(elf2tab_ver))
     os.makedirs(self.tab_folder, exist_ok=True)
     tab_filename = os.path.join(self.tab_folder,
                                 "{}.tab".format(self.args.application))
     elf2tab_args = [
-        "elf2tab", package_parameter, self.args.application, "-o", tab_filename
+        "elf2tab", "--deterministic", "--package-name", self.args.application,
+        "-o", tab_filename
     ]
+    if self.args.verbose_build:
+      elf2tab_args.append("--verbose")
     for arch, app_file in binaries.items():
       dest_file = os.path.join(self.tab_folder, "{}.elf".format(arch))
       shutil.copyfile(app_file, dest_file)
@@ -386,7 +428,11 @@ class OpenSKInstaller:
         "--stack={}".format(STACK_SIZE), "--app-heap={}".format(APP_HEAP_SIZE),
         "--kernel-heap=1024", "--protected-region-size=64"
     ])
-    self.checked_command_output(elf2tab_args)
+    if self.args.elf2tab_output:
+      output = self.checked_command_output(elf2tab_args)
+      self.args.elf2tab_output.write(output)
+    else:
+      self.checked_command(elf2tab_args)
 
   def install_tab_file(self, tab_filename):
     assert self.args.application
@@ -398,7 +444,7 @@ class OpenSKInstaller:
     setattr(args, "make", False)
     setattr(args, "no_replace", False)
     tock = loader.TockLoader(args)
-    tock.open(args)
+    tock.open()
     tabs = [tab.TAB(tab_filename)]
     try:
       tock.install(tabs, replace="yes", erase=args.erase)
@@ -418,15 +464,16 @@ class OpenSKInstaller:
 
   def install_tock_os(self):
     board_props = SUPPORTED_BOARDS[self.args.board]
-    kernel_file = os.path.join(board_props.path, "target", board_props.arch,
-                               "release", "{}.bin".format(self.args.board))
+    kernel_file = os.path.join("third_party", "tock", "target",
+                               board_props.arch, "release",
+                               "{}.bin".format(self.args.board))
     info("Flashing file {}.".format(kernel_file))
     with open(kernel_file, "rb") as f:
       kernel = f.read()
     args = copy.copy(self.tockloader_default_args)
     setattr(args, "address", board_props.app_address)
     tock = loader.TockLoader(args)
-    tock.open(args)
+    tock.open()
     try:
       tock.flash_binary(kernel, board_props.kernel_address)
     except TockLoaderException as e:
@@ -439,7 +486,7 @@ class OpenSKInstaller:
     args = copy.copy(self.tockloader_default_args)
     setattr(args, "address", board_props.padding_address)
     tock = loader.TockLoader(args)
-    tock.open(args)
+    tock.open()
     try:
       tock.flash_binary(padding, args.address)
     except TockLoaderException as e:
@@ -449,15 +496,42 @@ class OpenSKInstaller:
     args = copy.copy(self.tockloader_default_args)
     board_props = SUPPORTED_BOARDS[self.args.board]
     setattr(args, "app_address", board_props.app_address)
+    # Ensure we don't force erase all apps but only the apps starting
+    # at `board.app_address`. This makes sure we don't erase the padding.
+    setattr(args, "force", False)
     info("Erasing all installed applications")
     tock = loader.TockLoader(args)
-    tock.open(args)
+    tock.open()
     try:
-      tock.erase_apps(False)
+      tock.erase_apps()
     except TockLoaderException as e:
       # Erasing apps is not critical
       info(("A non-critical error occurred while erasing "
             "apps: {}".format(str(e))))
+
+  def clear_storage(self):
+    if self.args.programmer == "none":
+      return 0
+    info("Erasing the persistent storage")
+    board_props = SUPPORTED_BOARDS[self.args.board]
+    # Use tockloader if possible
+    if self.args.programmer in ("jlink", "openocd"):
+      storage = bytes([0xFF] * board_props.storage_size)
+      tock = loader.TockLoader(self.tockloader_default_args)
+      tock.open()
+      try:
+        tock.flash_binary(storage, board_props.storage_address)
+      except TockLoaderException as e:
+        fatal("Couldn't erase the persistent storage: {}".format(str(e)))
+      return 0
+    if self.args.programmer == "pyocd":
+      self.checked_command([
+          "pyocd", "erase", "--target={}".format(board_props.pyocd_target),
+          "--sector", "{}+{}".format(board_props.storage_address,
+                                     board_props.storage_size)
+      ])
+      return 0
+    fatal("Programmer {} is not supported.".format(self.args.programmer))
 
   # pylint: disable=protected-access
   def verify_flashed_app(self, expected_app):
@@ -465,6 +539,7 @@ class OpenSKInstaller:
       return False
     args = copy.copy(self.tockloader_default_args)
     tock = loader.TockLoader(args)
+    tock.open()
     app_found = False
     with tock._start_communication_with_board():
       apps = [app.name for app in tock._extract_all_app_headers()]
@@ -481,8 +556,9 @@ class OpenSKInstaller:
 
     if self.args.tockos:
       # Process kernel
-      kernel_path = os.path.join(board_props.path, "target", board_props.arch,
-                                 "release", "{}.bin".format(self.args.board))
+      kernel_path = os.path.join("third_party", "tock", "target",
+                                 board_props.arch, "release",
+                                 "{}.bin".format(self.args.board))
       with open(kernel_path, "rb") as kernel:
         kern_hex = intelhex.IntelHex()
         kern_hex.frombytes(kernel.read(), offset=board_props.kernel_address)
@@ -512,6 +588,10 @@ class OpenSKInstaller:
     final_hex.tofile(dest_file, format="hex")
 
   def check_prerequisites(self):
+    if not tockloader.__version__.startswith("1.4."):
+      fatal(("Your version of tockloader seems incompatible: found {}, "
+             "expected 1.4.x.".format(tockloader.__version__)))
+
     if self.args.programmer == "jlink":
       assert_mandatory_binary("JLinkExe")
 
@@ -554,7 +634,8 @@ class OpenSKInstaller:
     self.check_prerequisites()
     self.update_rustc_if_needed()
 
-    if not self.args.tockos and not self.args.application:
+    if not (self.args.tockos or self.args.application or
+            self.args.clear_storage):
       info("Nothing to do.")
       return 0
 
@@ -569,6 +650,10 @@ class OpenSKInstaller:
       info("No application selected.")
     else:
       self.build_example()
+
+    # Erase persistent storage
+    if self.args.clear_storage:
+      self.clear_storage()
 
     # Flashing
     board_props = SUPPORTED_BOARDS[self.args.board]
@@ -600,14 +685,14 @@ class OpenSKInstaller:
 
       if self.args.programmer == "pyocd":
         info("Flashing HEX file")
-        self.checked_command_output([
+        self.checked_command([
             "pyocd", "flash", "--target={}".format(board_props.pyocd_target),
             "--format=hex", "--erase=auto", dest_file
         ])
       if self.args.programmer == "nordicdfu":
         info("Creating DFU package")
         dfu_pkg_file = "target/{}_dfu.zip".format(self.args.board)
-        self.checked_command_output([
+        self.checked_command([
             "nrfutil", "pkg", "generate", "--hw-version=52", "--sd-req=0",
             "--application-version=1", "--application={}".format(dest_file),
             dfu_pkg_file
@@ -658,7 +743,7 @@ if __name__ == "__main__":
       choices=("boards", "programmers"),
       default=None,
       dest="listing",
-      help=("List supported boards or programmers, 1 per line and then exit."),
+      help="List supported boards or programmers, 1 per line and then exit.",
   )
   action_group.add_argument(
       "--board",
@@ -678,6 +763,14 @@ if __name__ == "__main__":
             "applications won't be erased from the board."),
   )
   main_parser.add_argument(
+      "--clear-storage",
+      action="store_true",
+      default=False,
+      dest="clear_storage",
+      help=("Erases the persistent storage when installing an application. "
+            "All stored data will be permanently lost."),
+  )
+  main_parser.add_argument(
       "--programmer",
       metavar="METHOD",
       dest="programmer",
@@ -694,6 +787,13 @@ if __name__ == "__main__":
       dest="tockos",
       help=("Only compiles and flash the application/example. "
             "Otherwise TockOS will also be bundled and flashed."),
+  )
+  main_parser.add_argument(
+      "--verbose-build",
+      action="store_true",
+      default=False,
+      dest="verbose_build",
+      help="Build everything in verbose mode.",
   )
 
   main_parser.add_argument(
@@ -739,6 +839,14 @@ if __name__ == "__main__":
             "support for U2F/CTAP1 protocol."),
   )
   main_parser.add_argument(
+      "--ctap2.1",
+      action=RemoveConstAction,
+      const="with_ctap2_1",
+      dest="features",
+      help=("Compiles the OpenSK application with backward compatible "
+            "support for CTAP2.1 protocol."),
+  )
+  main_parser.add_argument(
       "--regen-keys",
       action="store_true",
       default=False,
@@ -755,6 +863,15 @@ if __name__ == "__main__":
       dest="features",
       help=("Compiles and installs the OpenSK application without persistent "
             "storage (i.e. unplugging the key will reset the key)."),
+  )
+
+  main_parser.add_argument(
+      "--elf2tab-output",
+      metavar="FILE",
+      type=argparse.FileType("a"),
+      dest="elf2tab_output",
+      default=None,
+      help=("When set, the output of elf2tab is appended to this file."),
   )
 
   apps_group = main_parser.add_mutually_exclusive_group(required=True)

@@ -23,17 +23,21 @@ pub mod status_code;
 mod storage;
 mod timed_permission;
 
+#[cfg(feature = "with_ctap2_1")]
+use self::command::MAX_CREDENTIAL_COUNT_IN_LIST;
 use self::command::{
     AuthenticatorClientPinParameters, AuthenticatorGetAssertionParameters,
     AuthenticatorMakeCredentialParameters, Command,
 };
+#[cfg(feature = "with_ctap2_1")]
+use self::data_formats::AuthenticatorTransport;
 use self::data_formats::{
-    ClientPinSubCommand, CoseKey, GetAssertionHmacSecretInput, PackedAttestationStatement,
-    PublicKeyCredentialDescriptor, PublicKeyCredentialSource, PublicKeyCredentialType,
-    PublicKeyCredentialUserEntity, SignatureAlgorithm,
+    ClientPinSubCommand, CoseKey, CredentialProtectionPolicy, GetAssertionHmacSecretInput,
+    PackedAttestationStatement, PublicKeyCredentialDescriptor, PublicKeyCredentialParameter,
+    PublicKeyCredentialSource, PublicKeyCredentialType, PublicKeyCredentialUserEntity,
+    SignatureAlgorithm,
 };
 use self::hid::ChannelID;
-use self::key_material::{AAGUID, ATTESTATION_CERTIFICATE, ATTESTATION_PRIVATE_KEY};
 use self::response::{
     AuthenticatorClientPinResponse, AuthenticatorGetAssertionResponse,
     AuthenticatorGetInfoResponse, AuthenticatorMakeCredentialResponse, ResponseData,
@@ -98,6 +102,17 @@ const RESET_TIMEOUT_MS: isize = 10000;
 pub const FIDO2_VERSION_STRING: &str = "FIDO_2_0";
 #[cfg(feature = "with_ctap1")]
 pub const U2F_VERSION_STRING: &str = "U2F_V2";
+
+// We currently only support one algorithm for signatures: ES256.
+// This algorithm is requested in MakeCredential and advertized in GetInfo.
+pub const ES256_CRED_PARAM: PublicKeyCredentialParameter = PublicKeyCredentialParameter {
+    cred_type: PublicKeyCredentialType::PublicKey,
+    alg: SignatureAlgorithm::ES256,
+};
+// You can change this value to one of the following for more privacy.
+// - Some(CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList)
+// - Some(CredentialProtectionPolicy::UserVerificationRequired)
+const DEFAULT_CRED_PROTECT: Option<CredentialProtectionPolicy> = None;
 
 fn check_pin_auth(hmac_key: &[u8], hmac_contents: &[u8], pin_auth: &[u8]) -> bool {
     if pin_auth.len() != PIN_AUTH_LENGTH {
@@ -324,6 +339,7 @@ where
             user_handle: vec![],
             other_ui: None,
             cred_random: None,
+            cred_protect_policy: None,
         })
     }
 
@@ -351,8 +367,10 @@ where
                     Command::AuthenticatorGetInfo => self.process_get_info(),
                     Command::AuthenticatorClientPin(params) => self.process_client_pin(params),
                     Command::AuthenticatorReset => self.process_reset(cid),
+                    #[cfg(feature = "with_ctap2_1")]
+                    Command::AuthenticatorSelection => self.process_selection(cid),
                     // TODO(kaczmarczyck) implement GetNextAssertion and FIDO 2.1 commands
-                    _ => unimplemented!(),
+                    _ => self.process_unknown_command(),
                 };
                 #[cfg(feature = "debug_ctap")]
                 writeln!(&mut Console::new(), "Sending response: {:#?}", response).unwrap();
@@ -413,42 +431,46 @@ where
             }
         }
 
-        let has_es_256 = pub_key_cred_params
-            .iter()
-            .any(|(credential_type, algorithm)| {
-                // Even though there is only one type now, checking seems safer in
-                // case of extension so you can't forget to update here.
-                *credential_type == PublicKeyCredentialType::PublicKey
-                    && *algorithm == SignatureAlgorithm::ES256 as i64
-            });
-        if !has_es_256 {
+        if !pub_key_cred_params.contains(&ES256_CRED_PARAM) {
             return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_ALGORITHM);
         }
 
-        let use_hmac_extension =
-            extensions.map_or(Ok(false), |e| e.has_make_credential_hmac_secret())?;
-        if use_hmac_extension && !options.rk {
-            // The extension is actually supported, but we need resident keys.
-            return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_EXTENSION);
-        }
+        let (use_hmac_extension, cred_protect_policy) = if let Some(extensions) = extensions {
+            let mut cred_protect = extensions.cred_protect;
+            if cred_protect.unwrap_or(CredentialProtectionPolicy::UserVerificationOptional)
+                < DEFAULT_CRED_PROTECT
+                    .unwrap_or(CredentialProtectionPolicy::UserVerificationOptional)
+            {
+                cred_protect = DEFAULT_CRED_PROTECT;
+            }
+            (extensions.hmac_secret, cred_protect)
+        } else {
+            (false, None)
+        };
+
         let cred_random = if use_hmac_extension {
+            if !options.rk {
+                // The extension is actually supported, but we need resident keys.
+                return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_EXTENSION);
+            }
             Some(self.rng.gen_uniform_u8x32().to_vec())
         } else {
             None
         };
-        let ed_flag = if use_hmac_extension { ED_FLAG } else { 0 };
+        // TODO(kaczmarczyck) unsolicited output for default credProtect level
+        let has_extension_output = use_hmac_extension || cred_protect_policy.is_some();
 
         let rp_id = rp.rp_id;
         if let Some(exclude_list) = exclude_list {
             for cred_desc in exclude_list {
                 if self
                     .persistent_store
-                    .find_credential(&rp_id, &cred_desc.key_id)
+                    .find_credential(&rp_id, &cred_desc.key_id, pin_uv_auth_param.is_none())
                     .is_some()
                 {
                     // Perform this check, so bad actors can't brute force exclude_list
-                    // without user interaction. Discard the user presence check's outcome.
-                    let _ = (self.check_user_presence)(cid);
+                    // without user interaction.
+                    (self.check_user_presence)(cid)?;
                     return Err(Ctap2StatusCode::CTAP2_ERR_CREDENTIAL_EXCLUDED);
                 }
             }
@@ -456,6 +478,7 @@ where
 
         // MakeCredential always requires user presence.
         // User verification depends on the PIN auth inputs, which are checked here.
+        let ed_flag = if has_extension_output { ED_FLAG } else { 0 };
         let flags = match pin_uv_auth_param {
             Some(pin_auth) => {
                 if self.persistent_store.pin_hash().is_none() {
@@ -498,6 +521,7 @@ where
                     .user_display_name
                     .map(|s| truncate_to_char_boundary(&s, 64).to_string()),
                 cred_random,
+                cred_protect_policy,
             };
             self.persistent_store.store_credential(credential_source)?;
             random_id
@@ -506,7 +530,7 @@ where
         };
 
         let mut auth_data = self.generate_auth_data(&rp_id_hash, flags);
-        auth_data.extend(AAGUID);
+        auth_data.extend(self.persistent_store.aaguid()?);
         // The length is fixed to 0x20 or 0x70 and fits one byte.
         if credential_id.len() > 0xFF {
             return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_RESPONSE_TOO_LONG);
@@ -518,29 +542,38 @@ where
             None => return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_RESPONSE_CANNOT_WRITE_CBOR),
         };
         auth_data.extend(cose_key);
-        if use_hmac_extension {
-            let extensions = cbor_map! {
-                "hmac-secret" => true,
+        if has_extension_output {
+            let hmac_secret_output = if use_hmac_extension { Some(true) } else { None };
+            let extensions_output = cbor_map_options! {
+                "hmac-secret" => hmac_secret_output,
+                "credProtect" => cred_protect_policy,
             };
-            if !cbor::write(extensions, &mut auth_data) {
+            if !cbor::write(extensions_output, &mut auth_data) {
                 return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_RESPONSE_CANNOT_WRITE_CBOR);
             }
         }
 
         let mut signature_data = auth_data.clone();
         signature_data.extend(client_data_hash);
-        let (signature, x5c) = if USE_BATCH_ATTESTATION {
-            let attestation_key =
-                crypto::ecdsa::SecKey::from_bytes(ATTESTATION_PRIVATE_KEY).unwrap();
-            (
-                attestation_key.sign_rfc6979::<crypto::sha256::Sha256>(&signature_data),
-                Some(vec![ATTESTATION_CERTIFICATE.to_vec()]),
-            )
-        } else {
-            (
+        // We currently use the presence of the attestation private key in the persistent storage to
+        // decide whether batch attestation is needed.
+        let (signature, x5c) = match self.persistent_store.attestation_private_key()? {
+            Some(attestation_private_key) => {
+                let attestation_key =
+                    crypto::ecdsa::SecKey::from_bytes(attestation_private_key).unwrap();
+                let attestation_certificate = self
+                    .persistent_store
+                    .attestation_certificate()?
+                    .ok_or(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+                (
+                    attestation_key.sign_rfc6979::<crypto::sha256::Sha256>(&signature_data),
+                    Some(vec![attestation_certificate]),
+                )
+            }
+            None => (
                 sk.sign_rfc6979::<crypto::sha256::Sha256>(&signature_data),
                 None,
-            )
+            ),
         };
         let attestation_statement = PackedAttestationStatement {
             alg: SignatureAlgorithm::ES256 as i64,
@@ -612,17 +645,15 @@ where
             }
         }
 
-        let get_assertion_hmac_secret_input = match extensions {
-            Some(extensions) => extensions.get_assertion_hmac_secret().transpose()?,
-            None => None,
-        };
-        if get_assertion_hmac_secret_input.is_some() && !options.up {
+        let hmac_secret_input = extensions.map(|e| e.hmac_secret).flatten();
+        if hmac_secret_input.is_some() && !options.up {
             // The extension is actually supported, but we need user presence.
             return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_EXTENSION);
         }
 
-        // The user verification bit depends on the existance of PIN auth, whereas
-        // user presence is requested as an option.
+        // The user verification bit depends on the existance of PIN auth, since we do
+        // not support internal UV. User presence is requested as an option.
+        let has_uv = pin_uv_auth_param.is_some();
         let mut flags = match pin_uv_auth_param {
             Some(pin_auth) => {
                 if self.persistent_store.pin_hash().is_none() {
@@ -645,7 +676,7 @@ where
         if options.up {
             flags |= UP_FLAG;
         }
-        if get_assertion_hmac_secret_input.is_some() {
+        if hmac_secret_input.is_some() {
             flags |= ED_FLAG;
         }
 
@@ -654,11 +685,14 @@ where
         let credentials = if let Some(allow_list) = allow_list {
             let mut found_credentials = vec![];
             for allowed_credential in allow_list {
-                match self
-                    .persistent_store
-                    .find_credential(&rp_id, &allowed_credential.key_id)
-                {
-                    Some(credential) => found_credentials.push(credential),
+                match self.persistent_store.find_credential(
+                    &rp_id,
+                    &allowed_credential.key_id,
+                    !has_uv,
+                ) {
+                    Some(credential) => {
+                        found_credentials.push(credential);
+                    }
                     None => {
                         if decrypted_credential.is_none() {
                             decrypted_credential = self
@@ -670,7 +704,7 @@ where
             found_credentials
         } else {
             // TODO(kaczmarczyck) use GetNextAssertion
-            self.persistent_store.filter_credential(&rp_id)
+            self.persistent_store.filter_credential(&rp_id, !has_uv)
         };
 
         let credential = if let Some(credential) = credentials.first() {
@@ -689,12 +723,12 @@ where
 
         let mut auth_data = self.generate_auth_data(&rp_id_hash, flags);
         // Process extensions.
-        if let Some(get_assertion_hmac_secret_input) = get_assertion_hmac_secret_input {
+        if let Some(hmac_secret_input) = hmac_secret_input {
             let GetAssertionHmacSecretInput {
                 key_agreement,
                 salt_enc,
                 salt_auth,
-            } = get_assertion_hmac_secret_input;
+            } = hmac_secret_input;
             let pk: crypto::ecdh::PubKey = CoseKey::try_into(key_agreement)?;
             let shared_secret = self.key_agreement_key.exchange_x_sha256(&pk);
             // HMAC-secret does the same 16 byte truncated check.
@@ -709,10 +743,10 @@ where
                 None => return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_EXTENSION),
             };
 
-            let extensions = cbor_map! {
+            let extensions_output = cbor_map! {
                 "hmac-secret" => encrypted_output,
             };
-            if !cbor::write(extensions, &mut auth_data) {
+            if !cbor::write(extensions_output, &mut auth_data) {
                 return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_RESPONSE_CANNOT_WRITE_CBOR);
             }
         }
@@ -751,7 +785,7 @@ where
 
     fn process_get_info(&self) -> Result<ResponseData, Ctap2StatusCode> {
         let mut options_map = BTreeMap::new();
-        // TODO(kaczmarczyck) add FIDO 2.1 options
+        // TODO(kaczmarczyck) add authenticatorConfig and credProtect options
         options_map.insert(String::from("rk"), true);
         options_map.insert(String::from("up"), true);
         options_map.insert(
@@ -766,12 +800,25 @@ where
                     String::from(FIDO2_VERSION_STRING),
                 ],
                 extensions: Some(vec![String::from("hmac-secret")]),
-                aaguid: *AAGUID,
+                aaguid: *self.persistent_store.aaguid()?,
                 options: Some(options_map),
                 max_msg_size: Some(1024),
                 pin_protocols: Some(vec![
                     CtapState::<R, CheckUserPresence>::PIN_PROTOCOL_VERSION,
                 ]),
+                #[cfg(feature = "with_ctap2_1")]
+                max_credential_count_in_list: MAX_CREDENTIAL_COUNT_IN_LIST.map(|c| c as u64),
+                // You can use ENCRYPTED_CREDENTIAL_ID_SIZE here, but if your
+                // browser passes that value, it might be used to fingerprint.
+                #[cfg(feature = "with_ctap2_1")]
+                max_credential_id_length: None,
+                #[cfg(feature = "with_ctap2_1")]
+                transports: Some(vec![AuthenticatorTransport::Usb]),
+                #[cfg(feature = "with_ctap2_1")]
+                algorithms: Some(vec![ES256_CRED_PARAM]),
+                default_cred_protect: DEFAULT_CRED_PROTECT,
+                #[cfg(feature = "with_ctap2_1")]
+                firmware_version: None,
             },
         ))
     }
@@ -1055,6 +1102,16 @@ where
         Ok(ResponseData::AuthenticatorReset)
     }
 
+    #[cfg(feature = "with_ctap2_1")]
+    fn process_selection(&self, cid: ChannelID) -> Result<ResponseData, Ctap2StatusCode> {
+        (self.check_user_presence)(cid)?;
+        Ok(ResponseData::AuthenticatorSelection)
+    }
+
+    fn process_unknown_command(&self) -> Result<ResponseData, Ctap2StatusCode> {
+        Err(Ctap2StatusCode::CTAP1_ERR_INVALID_COMMAND)
+    }
+
     pub fn generate_auth_data(&self, rp_id_hash: &[u8], flag_byte: u8) -> Vec<u8> {
         let mut auth_data = vec![];
         auth_data.extend(rp_id_hash);
@@ -1074,8 +1131,8 @@ where
 #[cfg(test)]
 mod test {
     use super::data_formats::{
-        Extensions, GetAssertionOptions, MakeCredentialOptions, PublicKeyCredentialRpEntity,
-        PublicKeyCredentialUserEntity,
+        GetAssertionExtensions, GetAssertionOptions, MakeCredentialExtensions,
+        MakeCredentialOptions, PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity,
     };
     use super::*;
     use crypto::rng256::ThreadRng256;
@@ -1093,6 +1150,9 @@ mod test {
         let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
         let info_reponse = ctap_state.process_command(&[0x04], DUMMY_CHANNEL_ID);
 
+        #[cfg(feature = "with_ctap2_1")]
+        let mut expected_response = vec![0x00, 0xA8, 0x01];
+        #[cfg(not(feature = "with_ctap2_1"))]
         let mut expected_response = vec![0x00, 0xA6, 0x01];
         // The difference here is a longer array of supported versions.
         #[cfg(not(feature = "with_ctap1"))]
@@ -1106,11 +1166,20 @@ mod test {
             0x02, 0x81, 0x6B, 0x68, 0x6D, 0x61, 0x63, 0x2D, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74,
             0x03, 0x50,
         ]);
-        expected_response.extend(AAGUID);
+        expected_response.extend(ctap_state.persistent_store.aaguid().unwrap());
         expected_response.extend(&[
             0x04, 0xA3, 0x62, 0x72, 0x6B, 0xF5, 0x62, 0x75, 0x70, 0xF5, 0x69, 0x63, 0x6C, 0x69,
             0x65, 0x6E, 0x74, 0x50, 0x69, 0x6E, 0xF4, 0x05, 0x19, 0x04, 0x00, 0x06, 0x81, 0x01,
         ]);
+        #[cfg(feature = "with_ctap2_1")]
+        expected_response.extend(
+            [
+                0x09, 0x81, 0x63, 0x75, 0x73, 0x62, 0x0A, 0x81, 0xA2, 0x63, 0x61, 0x6C, 0x67, 0x26,
+                0x64, 0x74, 0x79, 0x70, 0x65, 0x6A, 0x70, 0x75, 0x62, 0x6C, 0x69, 0x63, 0x2D, 0x6B,
+                0x65, 0x79,
+            ]
+            .iter(),
+        );
 
         assert_eq!(info_reponse, expected_response);
     }
@@ -1128,10 +1197,7 @@ mod test {
             user_display_name: None,
             user_icon: None,
         };
-        let pub_key_cred_params = vec![(
-            PublicKeyCredentialType::PublicKey,
-            SignatureAlgorithm::ES256 as i64,
-        )];
+        let pub_key_cred_params = vec![ES256_CRED_PARAM];
         let options = MakeCredentialOptions {
             rk: true,
             uv: false,
@@ -1147,6 +1213,32 @@ mod test {
             pin_uv_auth_param: None,
             pin_uv_auth_protocol: None,
         }
+    }
+
+    fn create_make_credential_parameters_with_exclude_list(
+        excluded_credential_id: &[u8],
+    ) -> AuthenticatorMakeCredentialParameters {
+        let excluded_credential_descriptor = PublicKeyCredentialDescriptor {
+            key_type: PublicKeyCredentialType::PublicKey,
+            key_id: excluded_credential_id.to_vec(),
+            transports: None,
+        };
+        let exclude_list = Some(vec![excluded_credential_descriptor]);
+        let mut make_credential_params = create_minimal_make_credential_parameters();
+        make_credential_params.exclude_list = exclude_list;
+        make_credential_params
+    }
+
+    fn create_make_credential_parameters_with_cred_protect_policy(
+        policy: CredentialProtectionPolicy,
+    ) -> AuthenticatorMakeCredentialParameters {
+        let extensions = Some(MakeCredentialExtensions {
+            hmac_secret: false,
+            cred_protect: Some(policy),
+        });
+        let mut make_credential_params = create_minimal_make_credential_parameters();
+        make_credential_params.extensions = extensions;
+        make_credential_params
     }
 
     #[test]
@@ -1173,7 +1265,7 @@ mod test {
                     0x34, 0xE2, 0x75, 0x1E, 0x68, 0x2F, 0xAB, 0x9F, 0x2D, 0x30, 0xAB, 0x13, 0xD2,
                     0x12, 0x55, 0x86, 0xCE, 0x19, 0x47, 0x41, 0x00, 0x00, 0x00, 0x00,
                 ];
-                expected_auth_data.extend(AAGUID);
+                expected_auth_data.extend(ctap_state.persistent_store.aaguid().unwrap());
                 expected_auth_data.extend(&[0x00, 0x20]);
                 assert_eq!(
                     auth_data[0..expected_auth_data.len()],
@@ -1210,7 +1302,7 @@ mod test {
                     0x34, 0xE2, 0x75, 0x1E, 0x68, 0x2F, 0xAB, 0x9F, 0x2D, 0x30, 0xAB, 0x13, 0xD2,
                     0x12, 0x55, 0x86, 0xCE, 0x19, 0x47, 0x41, 0x00, 0x00, 0x00, 0x00,
                 ];
-                expected_auth_data.extend(AAGUID);
+                expected_auth_data.extend(ctap_state.persistent_store.aaguid().unwrap());
                 expected_auth_data.extend(&[0x00, ENCRYPTED_CREDENTIAL_ID_SIZE as u8]);
                 assert_eq!(
                     auth_data[0..expected_auth_data.len()],
@@ -1228,12 +1320,8 @@ mod test {
         let user_immediately_present = |_| Ok(());
         let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
 
-        let pub_key_cred_params = vec![(
-            PublicKeyCredentialType::PublicKey,
-            SignatureAlgorithm::ES256 as i64 + 1, // any different number works
-        )];
         let mut make_credential_params = create_minimal_make_credential_parameters();
-        make_credential_params.pub_key_cred_params = pub_key_cred_params;
+        make_credential_params.pub_key_cred_params = vec![];
         let make_credential_response =
             ctap_state.process_make_credential(make_credential_params, DUMMY_CHANNEL_ID);
 
@@ -1251,35 +1339,81 @@ mod test {
         let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
 
         let excluded_credential_id = vec![0x01, 0x23, 0x45, 0x67];
+        let make_credential_params =
+            create_make_credential_parameters_with_exclude_list(&excluded_credential_id);
         let excluded_credential_source = PublicKeyCredentialSource {
             key_type: PublicKeyCredentialType::PublicKey,
-            credential_id: excluded_credential_id.clone(),
+            credential_id: excluded_credential_id,
             private_key: excluded_private_key,
             rp_id: String::from("example.com"),
             user_handle: vec![],
             other_ui: None,
             cred_random: None,
+            cred_protect_policy: None,
         };
         assert!(ctap_state
             .persistent_store
             .store_credential(excluded_credential_source)
             .is_ok());
 
-        let excluded_credential_descriptor = PublicKeyCredentialDescriptor {
-            key_type: PublicKeyCredentialType::PublicKey,
-            key_id: excluded_credential_id,
-            transports: None,
-        };
-        let exclude_list = Some(vec![excluded_credential_descriptor]);
-        let mut make_credential_params = create_minimal_make_credential_parameters();
-        make_credential_params.exclude_list = exclude_list;
         let make_credential_response =
             ctap_state.process_make_credential(make_credential_params, DUMMY_CHANNEL_ID);
-
         assert_eq!(
             make_credential_response,
             Err(Ctap2StatusCode::CTAP2_ERR_CREDENTIAL_EXCLUDED)
         );
+    }
+
+    #[test]
+    fn test_process_make_credential_credential_with_cred_protect() {
+        let mut rng = ThreadRng256 {};
+        let user_immediately_present = |_| Ok(());
+        let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
+
+        let test_policy = CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList;
+        let make_credential_params =
+            create_make_credential_parameters_with_cred_protect_policy(test_policy);
+        let make_credential_response =
+            ctap_state.process_make_credential(make_credential_params, DUMMY_CHANNEL_ID);
+        assert!(make_credential_response.is_ok());
+
+        let stored_credential = ctap_state
+            .persistent_store
+            .filter_credential("example.com", false)
+            .pop()
+            .unwrap();
+        let credential_id = stored_credential.credential_id;
+        assert_eq!(stored_credential.cred_protect_policy, Some(test_policy));
+
+        let make_credential_params =
+            create_make_credential_parameters_with_exclude_list(&credential_id);
+        let make_credential_response =
+            ctap_state.process_make_credential(make_credential_params, DUMMY_CHANNEL_ID);
+        assert_eq!(
+            make_credential_response,
+            Err(Ctap2StatusCode::CTAP2_ERR_CREDENTIAL_EXCLUDED)
+        );
+
+        let test_policy = CredentialProtectionPolicy::UserVerificationRequired;
+        let make_credential_params =
+            create_make_credential_parameters_with_cred_protect_policy(test_policy);
+        let make_credential_response =
+            ctap_state.process_make_credential(make_credential_params, DUMMY_CHANNEL_ID);
+        assert!(make_credential_response.is_ok());
+
+        let stored_credential = ctap_state
+            .persistent_store
+            .filter_credential("example.com", false)
+            .pop()
+            .unwrap();
+        let credential_id = stored_credential.credential_id;
+        assert_eq!(stored_credential.cred_protect_policy, Some(test_policy));
+
+        let make_credential_params =
+            create_make_credential_parameters_with_exclude_list(&credential_id);
+        let make_credential_response =
+            ctap_state.process_make_credential(make_credential_params, DUMMY_CHANNEL_ID);
+        assert!(make_credential_response.is_ok());
     }
 
     #[test]
@@ -1288,9 +1422,10 @@ mod test {
         let user_immediately_present = |_| Ok(());
         let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
 
-        let mut extension_map = BTreeMap::new();
-        extension_map.insert("hmac-secret".to_string(), cbor_bool!(true));
-        let extensions = Some(Extensions::new(extension_map));
+        let extensions = Some(MakeCredentialExtensions {
+            hmac_secret: true,
+            cred_protect: None,
+        });
         let mut make_credential_params = create_minimal_make_credential_parameters();
         make_credential_params.extensions = extensions;
         let make_credential_response =
@@ -1310,7 +1445,7 @@ mod test {
                     0x34, 0xE2, 0x75, 0x1E, 0x68, 0x2F, 0xAB, 0x9F, 0x2D, 0x30, 0xAB, 0x13, 0xD2,
                     0x12, 0x55, 0x86, 0xCE, 0x19, 0x47, 0xC1, 0x00, 0x00, 0x00, 0x00,
                 ];
-                expected_auth_data.extend(AAGUID);
+                expected_auth_data.extend(ctap_state.persistent_store.aaguid().unwrap());
                 expected_auth_data.extend(&[0x00, 0x20]);
                 assert_eq!(
                     auth_data[0..expected_auth_data.len()],
@@ -1400,9 +1535,10 @@ mod test {
         let user_immediately_present = |_| Ok(());
         let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
 
-        let mut extension_map = BTreeMap::new();
-        extension_map.insert("hmac-secret".to_string(), cbor_bool!(true));
-        let make_extensions = Some(Extensions::new(extension_map));
+        let make_extensions = Some(MakeCredentialExtensions {
+            hmac_secret: true,
+            cred_protect: None,
+        });
         let mut make_credential_params = create_minimal_make_credential_parameters();
         make_credential_params.extensions = make_extensions;
         assert!(ctap_state
@@ -1410,15 +1546,15 @@ mod test {
             .is_ok());
 
         let pk = sk.genpk();
-        let hmac_secret_parameters = cbor_map! {
-            1 => cbor::Value::Map(CoseKey::from(pk).0),
-            2 => vec![0; 32],
-            3 => vec![0; 16],
+        let hmac_secret_input = GetAssertionHmacSecretInput {
+            key_agreement: CoseKey::from(pk),
+            salt_enc: vec![0x02; 32],
+            salt_auth: vec![0x03; 16],
         };
-        let mut extension_map = BTreeMap::new();
-        extension_map.insert("hmac-secret".to_string(), hmac_secret_parameters);
+        let get_extensions = Some(GetAssertionExtensions {
+            hmac_secret: Some(hmac_secret_input),
+        });
 
-        let get_extensions = Some(Extensions::new(extension_map));
         let get_assertion_params = AuthenticatorGetAssertionParameters {
             rp_id: String::from("example.com"),
             client_data_hash: vec![0xCD],
@@ -1441,6 +1577,106 @@ mod test {
     }
 
     #[test]
+    fn test_residential_process_get_assertion_with_cred_protect() {
+        let mut rng = ThreadRng256 {};
+        let private_key = crypto::ecdsa::SecKey::gensk(&mut rng);
+        let credential_id = rng.gen_uniform_u8x32().to_vec();
+        let user_immediately_present = |_| Ok(());
+        let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
+
+        let cred_desc = PublicKeyCredentialDescriptor {
+            key_type: PublicKeyCredentialType::PublicKey,
+            key_id: credential_id.clone(),
+            transports: None, // You can set USB as a hint here.
+        };
+        let credential = PublicKeyCredentialSource {
+            key_type: PublicKeyCredentialType::PublicKey,
+            credential_id: credential_id.clone(),
+            private_key: private_key.clone(),
+            rp_id: String::from("example.com"),
+            user_handle: vec![0x00],
+            other_ui: None,
+            cred_random: None,
+            cred_protect_policy: Some(
+                CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList,
+            ),
+        };
+        assert!(ctap_state
+            .persistent_store
+            .store_credential(credential)
+            .is_ok());
+
+        let get_assertion_params = AuthenticatorGetAssertionParameters {
+            rp_id: String::from("example.com"),
+            client_data_hash: vec![0xCD],
+            allow_list: None,
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let get_assertion_response =
+            ctap_state.process_get_assertion(get_assertion_params, DUMMY_CHANNEL_ID);
+        assert_eq!(
+            get_assertion_response,
+            Err(Ctap2StatusCode::CTAP2_ERR_NO_CREDENTIALS),
+        );
+
+        let get_assertion_params = AuthenticatorGetAssertionParameters {
+            rp_id: String::from("example.com"),
+            client_data_hash: vec![0xCD],
+            allow_list: Some(vec![cred_desc.clone()]),
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let get_assertion_response =
+            ctap_state.process_get_assertion(get_assertion_params, DUMMY_CHANNEL_ID);
+        assert!(get_assertion_response.is_ok());
+
+        let credential = PublicKeyCredentialSource {
+            key_type: PublicKeyCredentialType::PublicKey,
+            credential_id,
+            private_key,
+            rp_id: String::from("example.com"),
+            user_handle: vec![0x00],
+            other_ui: None,
+            cred_random: None,
+            cred_protect_policy: Some(CredentialProtectionPolicy::UserVerificationRequired),
+        };
+        assert!(ctap_state
+            .persistent_store
+            .store_credential(credential)
+            .is_ok());
+
+        let get_assertion_params = AuthenticatorGetAssertionParameters {
+            rp_id: String::from("example.com"),
+            client_data_hash: vec![0xCD],
+            allow_list: Some(vec![cred_desc]),
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let get_assertion_response =
+            ctap_state.process_get_assertion(get_assertion_params, DUMMY_CHANNEL_ID);
+        assert_eq!(
+            get_assertion_response,
+            Err(Ctap2StatusCode::CTAP2_ERR_NO_CREDENTIALS),
+        );
+    }
+
+    #[test]
     fn test_process_reset() {
         let mut rng = ThreadRng256 {};
         let user_immediately_present = |_| Ok(());
@@ -1456,6 +1692,7 @@ mod test {
             user_handle: vec![],
             other_ui: None,
             cred_random: None,
+            cred_protect_policy: None,
         };
         assert!(ctap_state
             .persistent_store
@@ -1481,6 +1718,18 @@ mod test {
             reset_reponse,
             Err(Ctap2StatusCode::CTAP2_ERR_KEEPALIVE_CANCEL)
         );
+    }
+
+    #[test]
+    fn test_process_unknown_command() {
+        let mut rng = ThreadRng256 {};
+        let user_immediately_present = |_| Ok(());
+        let mut ctap_state = CtapState::new(&mut rng, user_immediately_present);
+
+        // This command does not exist.
+        let reset_reponse = ctap_state.process_command(&[0xDF], DUMMY_CHANNEL_ID);
+        let expected_response = vec![Ctap2StatusCode::CTAP1_ERR_INVALID_COMMAND as u8];
+        assert_eq!(reset_reponse, expected_response);
     }
 
     #[test]

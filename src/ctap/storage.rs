@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::crypto::rng256::Rng256;
-use crate::ctap::data_formats::PublicKeyCredentialSource;
+use crate::ctap::data_formats::{CredentialProtectionPolicy, PublicKeyCredentialSource};
 use crate::ctap::status_code::Ctap2StatusCode;
-use crate::ctap::PIN_AUTH_LENGTH;
+use crate::ctap::{key_material, PIN_AUTH_LENGTH, USE_BATCH_ATTESTATION};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryInto;
@@ -56,9 +56,14 @@ const GLOBAL_SIGNATURE_COUNTER: usize = 1;
 const MASTER_KEYS: usize = 2;
 const PIN_HASH: usize = 3;
 const PIN_RETRIES: usize = 4;
-const NUM_TAGS: usize = 5;
+const ATTESTATION_PRIVATE_KEY: usize = 5;
+const ATTESTATION_CERTIFICATE: usize = 6;
+const AAGUID: usize = 7;
+const NUM_TAGS: usize = 8;
 
 const MAX_PIN_RETRIES: u8 = 6;
+const ATTESTATION_PRIVATE_KEY_LENGTH: usize = 32;
+const AAGUID_LENGTH: usize = 16;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
@@ -73,6 +78,9 @@ enum Key {
     MasterKeys,
     PinHash,
     PinRetries,
+    AttestationPrivateKey,
+    AttestationCertificate,
+    Aaguid,
 }
 
 pub struct MasterKeys<'a> {
@@ -124,6 +132,9 @@ impl StoreConfig for Config {
             MASTER_KEYS => add(Key::MasterKeys),
             PIN_HASH => add(Key::PinHash),
             PIN_RETRIES => add(Key::PinRetries),
+            ATTESTATION_PRIVATE_KEY => add(Key::AttestationPrivateKey),
+            ATTESTATION_CERTIFICATE => add(Key::AttestationCertificate),
+            AAGUID => add(Key::Aaguid),
             _ => debug_assert!(false),
         }
     }
@@ -132,17 +143,6 @@ impl StoreConfig for Config {
 pub struct PersistentStore {
     store: embedded_flash::Store<Storage, Config>,
 }
-
-#[cfg(feature = "ram_storage")]
-const PAGE_SIZE: usize = 0x100;
-#[cfg(not(feature = "ram_storage"))]
-const PAGE_SIZE: usize = 0x1000;
-
-const STORE_SIZE: usize = NUM_PAGES * PAGE_SIZE;
-
-#[cfg(not(any(test, feature = "ram_storage")))]
-#[link_section = ".app_state"]
-static STORE: [u8; STORE_SIZE] = [0xff; STORE_SIZE];
 
 impl PersistentStore {
     /// Gives access to the persistent store.
@@ -164,19 +164,16 @@ impl PersistentStore {
 
     #[cfg(not(any(test, feature = "ram_storage")))]
     fn new_prod_storage() -> Storage {
-        let store = unsafe {
-            // Safety: The store cannot alias because this function is called only once.
-            core::slice::from_raw_parts_mut(STORE.as_ptr() as *mut u8, STORE_SIZE)
-        };
-        unsafe {
-            // Safety: The store is in a writeable flash region.
-            Storage::new(store).unwrap()
-        }
+        Storage::new(NUM_PAGES).unwrap()
     }
 
     #[cfg(any(test, feature = "ram_storage"))]
     fn new_test_storage() -> Storage {
-        let store = vec![0xff; STORE_SIZE].into_boxed_slice();
+        #[cfg(not(test))]
+        const PAGE_SIZE: usize = 0x100;
+        #[cfg(test)]
+        const PAGE_SIZE: usize = 0x1000;
+        let store = vec![0xff; NUM_PAGES * PAGE_SIZE].into_boxed_slice();
         let options = embedded_flash::BufferOptions {
             word_size: 4,
             page_size: PAGE_SIZE,
@@ -198,6 +195,7 @@ impl PersistentStore {
                 .insert(StoreEntry {
                     tag: MASTER_KEYS,
                     data: &master_keys,
+                    sensitive: true,
                 })
                 .unwrap();
         }
@@ -206,8 +204,23 @@ impl PersistentStore {
                 .insert(StoreEntry {
                     tag: PIN_RETRIES,
                     data: &[MAX_PIN_RETRIES],
+                    sensitive: false,
                 })
                 .unwrap();
+        }
+        // The following 3 entries are meant to be written by vendor-specific commands.
+        if USE_BATCH_ATTESTATION {
+            if self.store.find_one(&Key::AttestationPrivateKey).is_none() {
+                self.set_attestation_private_key(key_material::ATTESTATION_PRIVATE_KEY)
+                    .unwrap();
+            }
+            if self.store.find_one(&Key::AttestationCertificate).is_none() {
+                self.set_attestation_certificate(key_material::ATTESTATION_CERTIFICATE)
+                    .unwrap();
+            }
+        }
+        if self.store.find_one(&Key::Aaguid).is_none() {
+            self.set_aaguid(key_material::AAGUID).unwrap();
         }
     }
 
@@ -215,6 +228,7 @@ impl PersistentStore {
         &self,
         rp_id: &str,
         credential_id: &[u8],
+        check_cred_protect: bool,
     ) -> Option<PublicKeyCredentialSource> {
         let key = Key::Credential {
             rp_id: Some(rp_id.into()),
@@ -225,7 +239,16 @@ impl PersistentStore {
         debug_assert_eq!(entry.tag, TAG_CREDENTIAL);
         let result = deserialize_credential(entry.data);
         debug_assert!(result.is_some());
-        result
+        if check_cred_protect
+            && result.as_ref().map_or(false, |cred| {
+                cred.cred_protect_policy
+                    == Some(CredentialProtectionPolicy::UserVerificationRequired)
+            })
+        {
+            None
+        } else {
+            result
+        }
     }
 
     pub fn store_credential(
@@ -245,6 +268,7 @@ impl PersistentStore {
         let new_entry = StoreEntry {
             tag: TAG_CREDENTIAL,
             data: &credential,
+            sensitive: true,
         };
         match old_entry {
             None => self.store.insert(new_entry)?,
@@ -256,7 +280,11 @@ impl PersistentStore {
         Ok(())
     }
 
-    pub fn filter_credential(&self, rp_id: &str) -> Vec<PublicKeyCredentialSource> {
+    pub fn filter_credential(
+        &self,
+        rp_id: &str,
+        check_cred_protect: bool,
+    ) -> Vec<PublicKeyCredentialSource> {
         self.store
             .find_all(&Key::Credential {
                 rp_id: Some(rp_id.into()),
@@ -269,6 +297,7 @@ impl PersistentStore {
                 debug_assert!(credential.is_some());
                 credential
             })
+            .filter(|cred| !check_cred_protect || cred.is_discoverable())
             .collect()
     }
 
@@ -299,6 +328,7 @@ impl PersistentStore {
                     .insert(StoreEntry {
                         tag: GLOBAL_SIGNATURE_COUNTER,
                         data: &buffer,
+                        sensitive: false,
                     })
                     .unwrap();
             }
@@ -312,6 +342,7 @@ impl PersistentStore {
                         StoreEntry {
                             tag: GLOBAL_SIGNATURE_COUNTER,
                             data: &buffer,
+                            sensitive: false,
                         },
                     )
                     .unwrap();
@@ -339,6 +370,7 @@ impl PersistentStore {
         let entry = StoreEntry {
             tag: PIN_HASH,
             data: pin_hash,
+            sensitive: true,
         };
         match self.store.find_one(&Key::PinHash) {
             None => self.store.insert(entry).unwrap(),
@@ -368,6 +400,7 @@ impl PersistentStore {
                 StoreEntry {
                     tag: PIN_RETRIES,
                     data: &[new_value],
+                    sensitive: false,
                 },
             )
             .unwrap();
@@ -381,15 +414,94 @@ impl PersistentStore {
                 StoreEntry {
                     tag: PIN_RETRIES,
                     data: &[MAX_PIN_RETRIES],
+                    sensitive: false,
                 },
             )
             .unwrap();
     }
 
+    pub fn attestation_private_key(
+        &self,
+    ) -> Result<Option<&[u8; ATTESTATION_PRIVATE_KEY_LENGTH]>, Ctap2StatusCode> {
+        let data = match self.store.find_one(&Key::AttestationPrivateKey) {
+            None => return Ok(None),
+            Some((_, entry)) => entry.data,
+        };
+        if data.len() != ATTESTATION_PRIVATE_KEY_LENGTH {
+            return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+        }
+        Ok(Some(array_ref!(data, 0, ATTESTATION_PRIVATE_KEY_LENGTH)))
+    }
+
+    pub fn set_attestation_private_key(
+        &mut self,
+        attestation_private_key: &[u8; ATTESTATION_PRIVATE_KEY_LENGTH],
+    ) -> Result<(), Ctap2StatusCode> {
+        let entry = StoreEntry {
+            tag: ATTESTATION_PRIVATE_KEY,
+            data: attestation_private_key,
+            sensitive: false,
+        };
+        match self.store.find_one(&Key::AttestationPrivateKey) {
+            None => self.store.insert(entry)?,
+            Some((index, _)) => self.store.replace(index, entry)?,
+        }
+        Ok(())
+    }
+
+    pub fn attestation_certificate(&self) -> Result<Option<Vec<u8>>, Ctap2StatusCode> {
+        let data = match self.store.find_one(&Key::AttestationCertificate) {
+            None => return Ok(None),
+            Some((_, entry)) => entry.data,
+        };
+        Ok(Some(data.to_vec()))
+    }
+
+    pub fn set_attestation_certificate(
+        &mut self,
+        attestation_certificate: &[u8],
+    ) -> Result<(), Ctap2StatusCode> {
+        let entry = StoreEntry {
+            tag: ATTESTATION_CERTIFICATE,
+            data: attestation_certificate,
+            sensitive: false,
+        };
+        match self.store.find_one(&Key::AttestationCertificate) {
+            None => self.store.insert(entry)?,
+            Some((index, _)) => self.store.replace(index, entry)?,
+        }
+        Ok(())
+    }
+
+    pub fn aaguid(&self) -> Result<&[u8; AAGUID_LENGTH], Ctap2StatusCode> {
+        let (_, entry) = self
+            .store
+            .find_one(&Key::Aaguid)
+            .ok_or(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+        let data = entry.data;
+        if data.len() != AAGUID_LENGTH {
+            return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+        }
+        Ok(array_ref!(data, 0, AAGUID_LENGTH))
+    }
+
+    pub fn set_aaguid(&mut self, aaguid: &[u8; AAGUID_LENGTH]) -> Result<(), Ctap2StatusCode> {
+        let entry = StoreEntry {
+            tag: AAGUID,
+            data: aaguid,
+            sensitive: false,
+        };
+        match self.store.find_one(&Key::Aaguid) {
+            None => self.store.insert(entry)?,
+            Some((index, _)) => self.store.replace(index, entry)?,
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self, rng: &mut impl Rng256) {
         loop {
             let index = {
-                let mut iter = self.store.iter();
+                let mut iter = self.store.iter().filter(|(_, entry)| should_reset(entry));
                 match iter.next() {
                     None => break,
                     Some((index, _)) => index,
@@ -408,6 +520,13 @@ impl From<StoreError> for Ctap2StatusCode {
             StoreError::InvalidTag => unreachable!(),
             StoreError::InvalidPrecondition => unreachable!(),
         }
+    }
+}
+
+fn should_reset(entry: &StoreEntry<'_>) -> bool {
+    match entry.tag {
+        ATTESTATION_PRIVATE_KEY | ATTESTATION_CERTIFICATE | AAGUID => false,
+        _ => true,
     }
 }
 
@@ -446,6 +565,7 @@ mod test {
             user_handle,
             other_ui: None,
             cred_random: None,
+            cred_protect_policy: None,
         }
     }
 
@@ -466,9 +586,9 @@ mod test {
         let storage = Storage::new(store, options);
         let store = embedded_flash::Store::new(storage, Config).unwrap();
         // We can replace 3 bytes with minimal overhead.
-        assert_eq!(store.replace_len(0), 2 * WORD_SIZE);
-        assert_eq!(store.replace_len(3), 2 * WORD_SIZE);
-        assert_eq!(store.replace_len(4), 3 * WORD_SIZE);
+        assert_eq!(store.replace_len(false, 0), 2 * WORD_SIZE);
+        assert_eq!(store.replace_len(false, 3), 3 * WORD_SIZE);
+        assert_eq!(store.replace_len(false, 4), 3 * WORD_SIZE);
     }
 
     #[test]
@@ -530,7 +650,7 @@ mod test {
             .is_ok());
         assert_eq!(persistent_store.count_credentials(), 1);
         assert_eq!(
-            &persistent_store.filter_credential("example.com"),
+            &persistent_store.filter_credential("example.com", false),
             &[expected_credential]
         );
 
@@ -578,7 +698,7 @@ mod test {
             .store_credential(credential_source2)
             .is_ok());
 
-        let filtered_credentials = persistent_store.filter_credential("example.com");
+        let filtered_credentials = persistent_store.filter_credential("example.com", false);
         assert_eq!(filtered_credentials.len(), 2);
         assert!(
             (filtered_credentials[0].credential_id == id0
@@ -586,6 +706,30 @@ mod test {
                 || (filtered_credentials[1].credential_id == id0
                     && filtered_credentials[0].credential_id == id1)
         );
+    }
+
+    #[test]
+    fn test_filter_with_cred_protect() {
+        let mut rng = ThreadRng256 {};
+        let mut persistent_store = PersistentStore::new(&mut rng);
+        assert_eq!(persistent_store.count_credentials(), 0);
+        let private_key = crypto::ecdsa::SecKey::gensk(&mut rng);
+        let credential = PublicKeyCredentialSource {
+            key_type: PublicKeyCredentialType::PublicKey,
+            credential_id: rng.gen_uniform_u8x32().to_vec(),
+            private_key,
+            rp_id: String::from("example.com"),
+            user_handle: vec![0x00],
+            other_ui: None,
+            cred_random: None,
+            cred_protect_policy: Some(
+                CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList,
+            ),
+        };
+        assert!(persistent_store.store_credential(credential).is_ok());
+
+        let no_credential = persistent_store.filter_credential("example.com", true);
+        assert_eq!(no_credential, vec![]);
     }
 
     #[test]
@@ -604,9 +748,9 @@ mod test {
             .store_credential(credential_source1)
             .is_ok());
 
-        let no_credential = persistent_store.find_credential("another.example.com", &id0);
+        let no_credential = persistent_store.find_credential("another.example.com", &id0, false);
         assert_eq!(no_credential, None);
-        let found_credential = persistent_store.find_credential("example.com", &id0);
+        let found_credential = persistent_store.find_credential("example.com", &id0, false);
         let expected_credential = PublicKeyCredentialSource {
             key_type: PublicKeyCredentialType::PublicKey,
             credential_id: id0,
@@ -615,8 +759,31 @@ mod test {
             user_handle: vec![0x00],
             other_ui: None,
             cred_random: None,
+            cred_protect_policy: None,
         };
         assert_eq!(found_credential, Some(expected_credential));
+    }
+
+    #[test]
+    fn test_find_with_cred_protect() {
+        let mut rng = ThreadRng256 {};
+        let mut persistent_store = PersistentStore::new(&mut rng);
+        assert_eq!(persistent_store.count_credentials(), 0);
+        let private_key = crypto::ecdsa::SecKey::gensk(&mut rng);
+        let credential = PublicKeyCredentialSource {
+            key_type: PublicKeyCredentialType::PublicKey,
+            credential_id: rng.gen_uniform_u8x32().to_vec(),
+            private_key,
+            rp_id: String::from("example.com"),
+            user_handle: vec![0x00],
+            other_ui: None,
+            cred_random: None,
+            cred_protect_policy: Some(CredentialProtectionPolicy::UserVerificationRequired),
+        };
+        assert!(persistent_store.store_credential(credential).is_ok());
+
+        let no_credential = persistent_store.find_credential("example.com", &vec![0x00], true);
+        assert_eq!(no_credential, None);
     }
 
     #[test]
@@ -687,5 +854,42 @@ mod test {
         // Resetting the pin retries resets the pin retries.
         persistent_store.reset_pin_retries();
         assert_eq!(persistent_store.pin_retries(), MAX_PIN_RETRIES);
+    }
+
+    #[test]
+    fn test_persistent_keys() {
+        let mut rng = ThreadRng256 {};
+        let mut persistent_store = PersistentStore::new(&mut rng);
+
+        // Make sure the attestation are absent. There is no batch attestation in tests.
+        assert!(persistent_store
+            .attestation_private_key()
+            .unwrap()
+            .is_none());
+        assert!(persistent_store
+            .attestation_certificate()
+            .unwrap()
+            .is_none());
+
+        // Make sure the persistent keys are initialized.
+        persistent_store
+            .set_attestation_private_key(key_material::ATTESTATION_PRIVATE_KEY)
+            .unwrap();
+        persistent_store
+            .set_attestation_certificate(key_material::ATTESTATION_CERTIFICATE)
+            .unwrap();
+        assert_eq!(persistent_store.aaguid().unwrap(), key_material::AAGUID);
+
+        // The persistent keys stay initialized and preserve their value after a reset.
+        persistent_store.reset(&mut rng);
+        assert_eq!(
+            persistent_store.attestation_private_key().unwrap().unwrap(),
+            key_material::ATTESTATION_PRIVATE_KEY
+        );
+        assert_eq!(
+            persistent_store.attestation_certificate().unwrap().unwrap(),
+            key_material::ATTESTATION_CERTIFICATE
+        );
+        assert_eq!(persistent_store.aaguid().unwrap(), key_material::AAGUID);
     }
 }
